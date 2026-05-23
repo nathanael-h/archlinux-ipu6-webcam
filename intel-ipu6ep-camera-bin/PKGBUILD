@@ -4,7 +4,7 @@
 pkgbase=ipu6-camera-bin
 pkgname=intel-ipu6ep-camera-bin-fix
 _pkgname=ipu6-camera-bins
-pkgver=r92.30e8766
+pkgver=r73.af5ba0c
 pkgrel=1
 pkgdesc="Intel IPU6 camera binaries (Alder Lake)"
 arch=('x86_64')
@@ -12,7 +12,11 @@ url="https://github.com/intel/ipu6-camera-bins"
 license=('unknown')
 depends=('intel-ipu6-dkms-git' 'glibc')
 makedepends=('git')
-provides=(ipu6-camera-bin intel-ipu6ep-camera-bin)
+# Also satisfy libcamera-ipu6 (AUR), whose PKGBUILD depends on the
+# unsuffixed AUR name intel-ipu6-camera-bin. Providing it here lets
+# this -ep-fix variant (Alder Lake only, ~smaller install) act as a
+# drop-in replacement for the multi-platform AUR package.
+provides=(ipu6-camera-bin intel-ipu6ep-camera-bin intel-ipu6-camera-bin)
 conflicts=(intel-ipu6-camera-bin intel-ipu6ep-camera-bin)
 source=("git+${url}.git#commit=af5ba0cb4a763569ac7514635013e9d870040bcf")
 sha256sums=('SKIP')

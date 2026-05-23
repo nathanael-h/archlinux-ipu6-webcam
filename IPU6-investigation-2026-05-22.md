@@ -298,8 +298,34 @@ cam -l
 This should restore the hardware-ISP image quality (the thing the
 upstream Simple pipeline can't match) while keeping you on the new
 kernel. The four "fixes you won't find documented elsewhere" from
-[libcamera-ipu6's README](file:///home/nathanael/src/libcamera-ipu6/README.md)
+[libcamera-ipu6's README](file:///home/user/src/libcamera-ipu6/README.md)
 handle the GDM/wireplumber/seccomp/libcamhal race conditions.
+
+### gcc 16 also breaks `intel-ipu6-camera-hal-git`
+
+On the same migration day, building Intel's userspace HAL (libcamhal)
+failed against gcc 16 because two legacy warnings were promoted to
+errors:
+
+```
+src/iutils/CameraDump.cpp:551
+  int bytes_read = 0;      // set but never read
+modules/ia_css/ipu6/include/ia_css_psys_terminal_impl.h:1862
+  unsigned mem_offset;     // set but never read
+```
+
+Both are pre-existing dead-variable warnings that older gcc tolerated.
+Fixed in this repo's [intel-ipu6ep-camera-hal-git/PKGBUILD](intel-ipu6ep-camera-hal-git/PKGBUILD)
+by exporting `-Wno-error=unused-but-set-variable` (+ a few related
+flags) in `build()`. The PKGBUILD now also `provides=intel-ipu6-camera-hal-git`
+so it is a drop-in for `libcamera-ipu6`'s dependency.
+
+Same naming-provides change applied to
+[intel-ipu6ep-camera-bin/PKGBUILD](intel-ipu6ep-camera-bin/PKGBUILD) —
+this Alder-Lake-only variant now also `provides=intel-ipu6-camera-bin`,
+so the same code path covers users on this repo's `-fix` variants and
+users coming from `libcamera-ipu6 → intel-ipu6-camera-{hal,bin}` AUR
+deps.
 
 ### Caveats
 
