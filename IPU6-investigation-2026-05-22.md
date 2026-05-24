@@ -338,6 +338,120 @@ deps.
   `obj-y` lines in `intel-ipu6-dkms-git/0001-kernel-7-build-fixes.patch`
   and fix `isx031.c`'s `suffix[0]`/`%s` mismatch yourself.
 
+## Gotchas hit during the `libcamera-ipu6` migration
+
+Two non-obvious things blocked the IPU6 pipeline from claiming the
+camera even after every package was installed correctly. The
+`libcamera-ipu6` README mentions related symptoms in passing; calling
+them out explicitly here because they cost ~an hour and there are no
+single-search-hit answers for either.
+
+### 1. `LIBCAMERA_PIPELINES_MATCH_LIST` must reach the user's environment
+
+The `libcamera-ipu6` package ships
+`/usr/lib/environment.d/60-libcamera-ipu6.conf` containing:
+
+```sh
+LIBCAMERA_PIPELINES_MATCH_LIST=ipu6,simple,uvcvideo
+```
+
+This forces the `ipu6` pipeline handler to win the probe race against
+`simple`. But `environment.d` is only read by PAM at session start
+(via `pam_systemd`). If you installed `libcamera-ipu6` and then ran
+`qcam` from a pre-existing terminal, the env var isn't set in that
+shell and `simple` claims the camera first.
+
+Symptom: `cam -l` / `qcam` logs show
+```
+INFO Camera camera_manager.cpp:223 Adding camera '\_SB_.PC00.LNK1' for pipeline handler simple
+INFO IPASoft soft_simple.cpp:258 IPASoft: Exposure 4-1784, gain 1-63.9961
+INFO SoftwareIsp software_isp.cpp:278 Input 1292x812-BGGR-10 stride 2624
+```
+
+Confirmation: prefix the command with the env var manually —
+`LIBCAMERA_PIPELINES_MATCH_LIST=ipu6 qcam` — and the pipeline handler
+flips to `ipu6`.
+
+Fix: log out and back in (or reboot) so PAM applies the env file. After
+that, `echo $LIBCAMERA_PIPELINES_MATCH_LIST` should print
+`ipu6,simple,uvcvideo`.
+
+### 2. `TAG+="uaccess"` is not always enough — add yourself to `video`
+
+The `/usr/lib/udev/rules.d/99-ipu6-psys.rules` rule tags `/dev/ipu-psys0`
+with `uaccess`, which *should* grant the active-session user a
+per-session ACL (same scheme `/dev/video*` uses). In practice the ACL
+sometimes never reaches an interactive shell — observed result was:
+
+```
+$ getfacl /dev/ipu-psys0
+# owner: root
+# group: video
+user::rw-
+group::rw-
+other::---
+```
+
+No `user:<you>:rw-` line, despite `udevadm info` correctly reporting
+`TAGS=:uaccess: CURRENT_TAGS=:uaccess:`. Likely cause: logind didn't
+re-trigger ACL application on the running session (could be that the
+session was non-`Class=user`, or that the rule fired before login).
+
+Symptom from libcamhal once `ipu6` pipeline is forced active:
+
+```
+CamHAL[ERR] Failed to open PSYS, error: Permission non accordée
+CamHAL[ERR] Failed to initialize Context
+CamHAL[ERR] create PG 187 error
+CamHAL[ERR] Failed to create PGs for executor: ipu6_lb_video_bayer
+```
+
+Fix: add yourself to the `video` group (which already owns the chardev):
+
+```fish
+sudo usermod -a -G video $USER
+# log out and back in, or:
+sudo reboot
+```
+
+After re-login, `id` should list `video` and `cat /dev/ipu-psys0` should
+fail with `operation not supported` (the device works, but isn't a
+regular file) instead of `Permission denied`.
+
+### 3. Harmless noise to ignore
+
+These error lines fire on every libcamhal init and do **not** prevent
+IPU6 enumeration or capture:
+
+```
+CamHAL[ERR] Malformed ET range in exposure time range configuration
+CamHAL[ERR] Parse AE eExposure time range failed
+CamHAL[ERR] Parse AE gain range failed
+```
+
+They come from a strict-parser branch in
+`src/platformdata/CameraParser.cpp:1386` that rejects what the shipped
+sensor XML clearly accepts elsewhere. Probably a stale check vs. an
+out-of-date sample format. libcamhal still parses the actual AIQB tuning
+file and opens the camera successfully — these are warnings dressed as
+errors.
+
+### End-to-end verification, 2026-05-24
+
+After adding to `video` group + reboot, `qcam 2>&1 | head -20` shows:
+
+```
+INFO Camera camera_manager.cpp:340 libcamera v0.7.0+ov01a10.2
+INFO IPU6 ipu6.cpp:714 Found 5 IPU6 camera(s) via libcamhal
+INFO IPU6 ipu6.cpp:175 Found IPU6 camera 0: ov01a10-uf (facing=1)
+INFO Camera camera_manager.cpp:223 Adding camera 'ipu6-ov01a10-uf-0' for pipeline handler ipu6
+INFO Camera camera.cpp:1216 configuring streams: (0) 1280x720-NV12/sYCC
+INFO IPU6 ipu6.cpp:232 Opening camera device 0
+```
+
+Image quality observably good — calibrated colors, no flicker, no
+manual exposure pin needed. Stack B confirmed working on `linux 7.0.9-arch1-1`.
+
 ## Recommended next steps
 
 1. **Short term**: install `libcamera-ipu6` from AUR now that the PSYS
