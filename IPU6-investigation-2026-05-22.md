@@ -436,6 +436,52 @@ out-of-date sample format. libcamhal still parses the actual AIQB tuning
 file and opens the camera successfully — these are warnings dressed as
 errors.
 
+### 4. Occasional wireplumber crash in `IPU6CameraData::workerThread()`
+
+Observed 2026-05-26: a single SIGABRT in `wireplumber` from the kervel
+fork's IPU6 worker thread:
+
+```
+FATAL request.cpp:111 assertion "ret == 1" failed in completeBuffer()
+  libcamera::Request::Private::completeBuffer(libcamera::FrameBuffer*)
+  libcamera::IPU6CameraData::workerThread()
+```
+
+`ret == 1` from `Request::Private::completeBuffer()` means the worker
+thread tried to mark a frame buffer as complete for a request, but the
+request's accounting said the buffer wasn't owned by it (already
+completed, or completed out of order). Classic race in an async-frame
+pipeline-handler bridge.
+
+**The good news**: systemd-user respawns wireplumber within ~1-2s, the
+`wait-libcamhal-shm` ExecStartPre clears the SHM boot race, libcamhal
+re-initializes from scratch, and the camera (+ audio + bluetooth media
+endpoints) come back cleanly. Auto-recovery works without intervention.
+
+**Not in the libcamera-ipu6 README's known-fix list** (#1 init refcount,
+#2 udev `uaccess`, #3 seccomp `@ipc`, #4 SHM boot race). Looks like a
+fifth race the maintainer hasn't hit yet.
+
+**No upstream fix available** as of 2026-05-26: the AUR PKGBUILD pins
+`kervel/libcamera@ipu6-pipeline-handler` commit `48748f15`, which is
+also the current HEAD of that branch. The branch is "12 commits ahead
+of and 88 commits behind libcamera-org/libcamera:master" — no churn on
+the IPU6 handler since the AUR pin was set.
+
+**Workaround for now**: live with the auto-recovery. **Do NOT**:
+- mask wireplumber (kills all PipeWire audio + video)
+- `pacman -Syu` libcamera (would pull upstream `libcamera` from `extra`,
+  which `conflicts/replaces` `libcamera-ipu6` and reverts you to the
+  Simple-pipeline / SoftISP dark-image path)
+- disable the camera "to test stability"
+
+**Long-term**: if reproducible, capture with `coredumpctl gdb wireplumber`
+and report at the AUR comments page for `libcamera-ipu6` and/or at
+[kervel/libcamera](https://github.com/kervel/libcamera/tree/ipu6-pipeline-handler).
+The fix would be in `IPU6CameraData::workerThread()` (or the libcamhal
+shim that calls into it) — likely a missing check that the buffer's
+parent request is still active before invoking `completeBuffer()`.
+
 ### End-to-end verification, 2026-05-24
 
 After adding to `video` group + reboot, `qcam 2>&1 | head -20` shows:
