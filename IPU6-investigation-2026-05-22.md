@@ -436,10 +436,16 @@ out-of-date sample format. libcamhal still parses the actual AIQB tuning
 file and opens the camera successfully — these are warnings dressed as
 errors.
 
-### 4. Occasional wireplumber crash in `IPU6CameraData::workerThread()`
+### 4. Recurring wireplumber crash in `IPU6CameraData::workerThread()`
 
-Observed 2026-05-26: a single SIGABRT in `wireplumber` from the kervel
-fork's IPU6 worker thread:
+> **Update 2026-05-28**: this is no longer a "single occurrence" — three
+> crashes now logged in `~/sound-video-crash/`, all with identical
+> stack offsets (`completeBuffer+0x1fc`, `workerThread+0x176`). Two of
+> them clustered 14 minutes apart in the same wireplumber session.
+> Auto-recovery still works each time, but the bug is real and frequent.
+
+Observed 2026-05-26 and 2026-05-28: SIGABRT in `wireplumber` from the
+kervel fork's IPU6 worker thread:
 
 ```
 FATAL request.cpp:111 assertion "ret == 1" failed in completeBuffer()
@@ -475,12 +481,48 @@ the IPU6 handler since the AUR pin was set.
   Simple-pipeline / SoftISP dark-image path)
 - disable the camera "to test stability"
 
-**Long-term**: if reproducible, capture with `coredumpctl gdb wireplumber`
-and report at the AUR comments page for `libcamera-ipu6` and/or at
-[kervel/libcamera](https://github.com/kervel/libcamera/tree/ipu6-pipeline-handler).
+**What the non-crashing threads show**: across all three coredumps the
+other libcamhal threads are uniformly **idle, waiting for work** —
+`RequestThread::threadLoop` blocked on a condition variable,
+`PSysProcessor::processNewFrame` and `PipeLiteExecutor::processNewFrame`
+both blocked in `BufferQueue::waitFreeBuffersInQueue`, `CaptureUnit::poll`
+and `SofSource::poll` blocked in `cros::V4L2DevicePoller::Poll`. So the
+race is exclusively in the libcamera-side worker that hands libcamhal
+frames back into libcamera's `Request`/`FrameBuffer` accounting — not
+in libcamhal itself.
+
+**Long-term**: capture with `coredumpctl gdb wireplumber` and report.
 The fix would be in `IPU6CameraData::workerThread()` (or the libcamhal
 shim that calls into it) — likely a missing check that the buffer's
 parent request is still active before invoking `completeBuffer()`.
+Useful one-shot capture script for the next occurrence:
+
+```fish
+coredumpctl info --no-pager 2>&1 | tail -50
+sudo coredumpctl gdb wireplumber <<'EOF' 2>&1 | tail -100
+thread apply all bt full
+frame 5
+info locals
+quit
+EOF
+journalctl --user --since "5 minutes ago" -o cat 2>&1 | tail -80 \
+  > /tmp/crash-context.log
+```
+
+The crash repro would also benefit from knowing the trigger — which app
+was using the camera, and whether the crash correlates with a
+state-transition event (call join/leave, camera toggle, lid close,
+suspend/resume, app close). Report the combination at:
+
+- AUR comments: <https://aur.archlinux.org/packages/libcamera-ipu6>
+- kervel/libcamera: <https://github.com/kervel/libcamera> (currently
+  no issue tracker enabled on the fork — comments on the maintainer's
+  AUR page is the most likely path)
+
+No upstream fix is available as of 2026-05-28 — the kervel branch HEAD
+is still `48748f15` (same as the AUR pin), 12 ahead and 88 behind
+`libcamera-org/libcamera:master`, and the maintainer hasn't bumped
+since 2026-04-30.
 
 ### End-to-end verification, 2026-05-24
 
