@@ -436,8 +436,14 @@ out-of-date sample format. libcamhal still parses the actual AIQB tuning
 file and opens the camera successfully — these are warnings dressed as
 errors.
 
-### 4. Recurring wireplumber crash in `IPU6CameraData::workerThread()`
+### 4. Recurring wireplumber crash in `IPU6CameraData::workerThread()` — **fixed on this branch**
 
+> **Update 2026-07-01**: after a fourth crash (2026-07-01 16:16, same
+> exact stack offsets as the earlier three), promoted the workaround
+> to a local fix. See
+> [libcamera-ipu6-fix/0003-ipu6-workerThread-drop-stale-buffers-instead-of-asserting.patch](libcamera-ipu6-fix/0003-ipu6-workerThread-drop-stale-buffers-instead-of-asserting.patch).
+> The remainder of this section is preserved as diagnostic context.
+>
 > **Update 2026-05-28**: this is no longer a "single occurrence" — three
 > crashes now logged in `~/sound-video-crash/`, all with identical
 > stack offsets (`completeBuffer+0x1fc`, `workerThread+0x176`). Two of
@@ -474,7 +480,30 @@ also the current HEAD of that branch. The branch is "12 commits ahead
 of and 88 commits behind libcamera-org/libcamera:master" — no churn on
 the IPU6 handler since the AUR pin was set.
 
-**Workaround for now**: live with the auto-recovery. **Do NOT**:
+**Fix landed 2026-07-01** in `libcamera-ipu6-fix/`. Guards the worker's
+`completeBuffer()` call with a `request->_d()->hasPendingBuffers()`
+check; drops stale buffers with a warning instead of aborting:
+
+```cpp
+// libcamera-ipu6-fix/0003-...workerThread...patch, in ipu6.cpp near
+// the existing completeBuffer() call at ipu6.cpp:457
+if (!request->_d()->hasPendingBuffers()) {
+    LOG(IPU6, Warning)
+        << "Dropping stale buffer for cancelled/completed request";
+} else {
+    pipe()->completeBuffer(request, buffer);
+    pipe()->completeRequest(request);
+}
+```
+
+The `-fix` variants of the split packages provide= and conflicts= the
+upstream AUR `libcamera-ipu6-*` names, so `pacman -U ./*.pkg.tar.zst`
+against the built directory replaces the AUR family atomically.
+`install.sh -m` uses this by default now (previously it cloned the
+AUR package).
+
+**Workaround if you can't run the fix yet**: live with the auto-recovery.
+**Do NOT**:
 - mask wireplumber (kills all PipeWire audio + video)
 - `pacman -Syu` libcamera (would pull upstream `libcamera` from `extra`,
   which `conflicts/replaces` `libcamera-ipu6` and reverts you to the

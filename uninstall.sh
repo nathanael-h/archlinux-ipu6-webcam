@@ -31,10 +31,16 @@ if systemctl list-unit-files 2>/dev/null | grep -q '^v4l2-relayd.service'; then
   sudo systemctl disable v4l2-relayd.service 2>/dev/null || true
 fi
 
-# --- Modern path: libcamera-ipu6 family (AUR / kervel libcamera fork) -------
+# --- Modern path: libcamera-ipu6 family (this repo's -fix variants + the
+# --- AUR versions they replace / kervel libcamera fork) --------------------
 # Remove in dependency order: GStreamer / Python first, then tools / IPA /
-# main. pacman with -Rsn drops the bridging libs cleanly.
-for pkg in gst-plugin-libcamera-ipu6 python-libcamera-ipu6 \
+# main. pacman with -Rsn drops the bridging libs cleanly. Handle both
+# libcamera-ipu6-*-fix (our fork, ships the workerThread race fix) and the
+# unsuffixed libcamera-ipu6-* (upstream AUR) so a system that was ever on
+# either path gets fully cleaned.
+for pkg in gst-plugin-libcamera-ipu6-fix python-libcamera-ipu6-fix \
+           libcamera-ipu6-tools-fix libcamera-ipu6-ipa-fix libcamera-ipu6-fix \
+           gst-plugin-libcamera-ipu6 python-libcamera-ipu6 \
            libcamera-ipu6-tools libcamera-ipu6-ipa libcamera-ipu6; do
   maybe_remove "${pkg}"
 done

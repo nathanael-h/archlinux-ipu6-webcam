@@ -1,0 +1,90 @@
+From: Nathanael Hannebert <nathanael.hannebert@vates.tech>
+Date: Wed, 01 Jul 2026
+Subject: [PATCH] ipu6: guard workerThread completeBuffer() against
+ requests whose pending set was cleared
+
+Fixes a recurring wireplumber SIGABRT with this exact backtrace:
+
+  FATAL default request.cpp:111 assertion "ret == 1" failed in completeBuffer()
+    libcamera::Request::Private::completeBuffer(FrameBuffer*) +0x1fc
+    libcamera::IPU6CameraData::workerThread() +0x176
+
+`Request::Private::completeBuffer()` does `pending_.erase(buffer)` and
+asserts the return value is exactly 1 -- i.e. the buffer must have been
+in the request's pending set. On the IPU6 pipeline we observed four
+instances of this abort over ~5 weeks. The wireplumber process
+auto-recovered each time via systemd-user Restart=, but audio blipped
+and it was starting to be user-visible.
+
+The race path we believe hits this:
+
+  1. `IPU6CameraData::workerThread` acquires `queueMutex_`, pops a
+     Request from `pendingRequests_`, releases the lock.
+  2. The worker spends ~50 ms copying HAL frame data into the
+     libcamera FrameBuffer with no lock held.
+  3. Concurrently, the application or PipeWire path calls
+     `PipelineHandler::stop()`. That runs
+     `request->_d()->cancel()` on each waiting request, which calls
+     `doCancelRequest()` and clears `pending_`. The IPU6 pipeline
+     handler's `stopStreaming()` also iterates its own residual
+     `pendingRequests_` and calls `buffer->_d()->cancel()` +
+     `completeBuffer()` on the buffers there.
+  4. If the request the worker popped in (1) shares its buffer
+     object with a request that has since been cancelled -- or if
+     the same request appears in another cancel path -- the buffer's
+     entry in `pending_` may have already been removed.
+  5. Worker calls `pipe()->completeBuffer(request, buffer)`.
+     `pending_.erase(buffer)` returns 0. Assertion fires. abort.
+
+We haven't fully characterised the exact path (kervel/libcamera fork
+is closed to issues; symbols in the wireplumber core dumps only tell
+us the worker is the culprit, not which app / stopDevice() timing
+triggered it). But regardless of the specific cause, the fix is the
+same: never blindly call `completeBuffer()` -- verify the request
+still has pending buffers to complete first, and if not, drop the
+frame with a warning rather than aborting.
+
+`Request::Private::hasPendingBuffers()` returns true iff the request's
+`pending_` set is non-empty. If it's already been cleared (by
+cancel()/complete()/anyone else), our completeBuffer() call would
+abort; log-and-skip instead.
+
+Residual race window between the guard check and the actual
+`pending_.erase(buffer)` is negligible in practice -- the guard is
+a couple of atomic-free memory reads whereas the crash window we're
+closing is a full frame copy (~50 ms).
+
+--- a/src/libcamera/pipeline/ipu6/ipu6.cpp
++++ b/src/libcamera/pipeline/ipu6/ipu6.cpp
+@@ -454,8 +454,29 @@ void IPU6CameraData::workerThread()
+ 				request->_d()->metadata().set(controls::SensorTimestamp,
+ 							     dqBuf ? static_cast<int64_t>(dqBuf->timestamp) : 0);
+
+-				pipe()->completeBuffer(request, buffer);
+-				pipe()->completeRequest(request);
++				/*
++				 * Guard against completing a buffer whose parent
++				 * Request has already had its `pending_` set
++				 * cleared (e.g. by Request::Private::cancel() on
++				 * a PipelineHandler::stop() / stopDevice() path).
++				 *
++				 * Without this guard,
++				 * Request::Private::completeBuffer() aborts on
++				 *   ASSERT(pending_.erase(buffer) == 1);
++				 * (request.cpp:111), taking wireplumber with it.
++				 *
++				 * See archlinux-ipu6-webcam
++				 * IPU6-investigation-2026-05-22.md gotcha #4 for
++				 * the recurring backtrace this fixes.
++				 */
++				if (!request->_d()->hasPendingBuffers()) {
++					LOG(IPU6, Warning)
++						<< "Dropping stale buffer for cancelled/"
++						   "completed request";
++				} else {
++					pipe()->completeBuffer(request, buffer);
++					pipe()->completeRequest(request);
++				}
+ 			}
+ 		}
+

@@ -186,29 +186,31 @@ for pkg in "${PKGS[@]}"; do
   build_and_install "${pkg}"
 done
 
-# Modern path: also build + install the libcamera-ipu6 AUR package family.
-# It replaces upstream libcamera / libcamera-ipa / libcamera-tools /
-# gst-plugin-libcamera with kervel-fork variants that talk to libcamhal.
+# Modern path: build + install this repo's libcamera-ipu6-fix, which is
+# a superset of the AUR libcamera-ipu6 package with one extra patch on
+# top (0003-...workerThread-drop-stale-buffers-instead-of-asserting)
+# that fixes a recurring wireplumber SIGABRT observed 4x over 5 weeks
+# -- see IPU6-investigation-2026-05-22.md gotcha #4.
+#
+# It provides= / conflicts= all five AUR libcamera-ipu6-* names so it
+# is a drop-in replacement. It also replaces upstream libcamera /
+# libcamera-ipa / libcamera-tools / gst-plugin-libcamera / python-libcamera.
 # All five split packages must be installed in one pacman transaction to
-# avoid the /usr/bin/libcamera-bug-report file conflict with libcamera-tools.
+# avoid the /usr/bin/libcamera-bug-report file conflict.
 install_libcamera_ipu6() {
-  local build_dir="${HOME}/.cache/archlinux-ipu6-webcam-build/libcamera-ipu6"
-  echo "# Build and install libcamera-ipu6 (AUR) into ${build_dir}"
-  mkdir -p "$(dirname "$build_dir")"
-  if [ ! -d "$build_dir/.git" ]; then
-    git clone https://aur.archlinux.org/libcamera-ipu6.git "$build_dir" \
-      || error "Failed to clone libcamera-ipu6 AUR repo"
-  else
-    (cd "$build_dir" && git pull --rebase --autostash 2>/dev/null) || true
+  local build_dir
+  build_dir="$(dirname "$(realpath "${BASH_SOURCE[0]}")")/libcamera-ipu6-fix"
+  if [ ! -d "$build_dir" ]; then
+    error "libcamera-ipu6-fix/ not found next to install.sh at ${build_dir}"
   fi
+  echo "# Build libcamera-ipu6-fix in ${build_dir}"
   pushd "$build_dir" >/dev/null
-  # -f rebuilds even if a .pkg.tar.zst is already present, --noconfirm skips
-  # the interactive cleanBuild/diff prompts. We don't use -i so we can install
-  # all five split packages in a single sudo pacman -U below.
-  makepkg -f --noconfirm || error "Failed to build libcamera-ipu6"
-  echo "# Install all libcamera-ipu6 split packages atomically"
+  # -f rebuilds even if a .pkg.tar.zst is already present. We don't use -i
+  # so we can install all five split packages in a single sudo pacman -U.
+  makepkg -f --noconfirm || error "Failed to build libcamera-ipu6-fix"
+  echo "# Install all libcamera-ipu6-fix split packages atomically"
   sudo pacman -U --noconfirm ./*.pkg.tar.zst \
-    || error "Failed to install libcamera-ipu6 split packages"
+    || error "Failed to install libcamera-ipu6-fix split packages"
   popd >/dev/null
   echo "=> SUCCESS"
 }

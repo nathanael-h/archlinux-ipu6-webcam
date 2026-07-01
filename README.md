@@ -82,6 +82,8 @@ upstream `intel_ipu6_isys` driver shipped with the kernel and adds:
    the camera as a native libcamera node (no `v4l2-relayd`, no
    `v4l2loopback`).
 
+Easiest: `./install.sh -m` does all of it. Manual step-by-step:
+
 ```fish
 # 1. Build + install the patched DKMS module (this repo)
 cd ~/src/archlinux-ipu6-webcam/intel-ipu6-dkms-git
@@ -100,14 +102,17 @@ sudo reboot
 lsmod | grep ipu6        # expect: intel_ipu6, intel_ipu6_isys, intel_ipu6_psys
 ls /dev/ipu-psys0        # must exist
 
-# 4. Build + install the libcamera fork that wires libcamhal to libcamera
-git clone https://aur.archlinux.org/libcamera-ipu6.git ~/src/libcamera-ipu6
-cd ~/src/libcamera-ipu6
+# 4. Build the libcamera fork -- this repo's libcamera-ipu6-fix, which is
+#    the AUR libcamera-ipu6 + one extra patch that fixes a recurring
+#    wireplumber crash in IPU6CameraData::workerThread(). See
+#    IPU6-investigation-2026-05-22.md gotcha #4.
+cd ~/src/archlinux-ipu6-webcam/libcamera-ipu6-fix
 makepkg  # build all five split packages
 
-# 5. Install ALL split packages in one transaction (avoids the
-#    libcamera-bug-report file conflict between libcamera-ipu6 and
-#    libcamera-tools — see IPU6-investigation-2026-05-22.md)
+# 5. Install ALL split packages in one transaction. The -fix variants
+#    provide= + replace= the AUR libcamera-ipu6-* names AND upstream
+#    libcamera / libcamera-ipa / libcamera-tools / gst-plugin-libcamera /
+#    python-libcamera, so pacman swaps everything in one atomic step.
 sudo pacman -U *.pkg.tar.zst
 
 # 6. Restart the PipeWire stack so it picks up the new libcamera
