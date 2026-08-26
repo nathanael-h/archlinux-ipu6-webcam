@@ -28,7 +28,7 @@ pkgname=(
 _libcamera_ver=0.7.0
 _ov01a10_iter=2
 pkgver=${_libcamera_ver}+ov01a10.${_ov01a10_iter}
-pkgrel=1
+pkgrel=3
 pkgdesc="libcamera with Intel IPU6 pipeline handler (kervel fork), OV01A10 support, and workerThread race fix"
 arch=(x86_64)
 url="https://github.com/kervel/libcamera"
@@ -98,7 +98,97 @@ prepare() {
   cd libcamera
   patch -Np1 < ../0001-ipa-Add-OV01A10-sensor-helper.patch
   patch -Np1 < ../0002-ipu6-make-libcamhal-init-process-global.patch
-  patch -Np1 < ../0003-ipu6-workerThread-drop-stale-buffers-instead-of-asserting.patch
+  # 0003 is applied via the Python transform below, not `patch -Np1`.
+  # See ../0003-...patch header for why (large multi-line block replacement).
+
+  # 0003 (pkgrel=3, 2026-08-26): guard IPU6CameraData::workerThread against
+  # a stale/cancelled request BEFORE the ~50 ms memcpy. Two important
+  # subtleties for pkgrel=3, promoted from pkgrel=2:
+  #
+  #   (A) Only the ONLY-caller-that-pops-queuedRequests_ is
+  #       PipelineHandler::completeRequest, and it stops at the first
+  #       RequestPending at the head. If our guard skips a request
+  #       silently, that request stays in queuedRequests_ with
+  #       status=RequestPending FOREVER, blocking every later completion
+  #       behind it. That's the "PipeWire graph goes stale after some
+  #       uptime" symptom -- systemctl --user restart pipewire ... fixes
+  #       it because the fresh graph doesn't inherit the stuck queue.
+  #       pkgrel=3 fixes this by calling pipe()->completeRequest(request)
+  #       in the skip path when status == RequestPending. That's safe:
+  #       Request::Private::complete() asserts status==RequestPending
+  #       (yes) and !hasPendingBuffers() (yes -- that's why we skipped),
+  #       both hold. If Request::Private::cancel() had cleared pending_
+  #       upstream, the resulting terminal state is RequestCancelled
+  #       (cancelled_ flag was set); otherwise RequestComplete. Both are
+  #       terminal states the drain-loop pops.
+  #
+  #   (B) When status != RequestPending, the request has already been
+  #       through complete() at least once. Calling completeRequest a
+  #       second time would trip complete()'s ASSERT(status ==
+  #       RequestPending) at request.cpp:132. So we keep the pure-skip
+  #       path only for that subcase.
+  python3 - <<'PY'
+p = 'src/libcamera/pipeline/ipu6/ipu6.cpp'
+s = open(p).read()
+
+# The exact block that ships in kervel/libcamera@48748f15. String-replace
+# so we don't have to fight `patch` with drifting line numbers -- the
+# block just needs to appear verbatim in the source.
+old = '''		if (request) {
+			/* Copy HAL buffer data into the libcamera FrameBuffer */
+			FrameBuffer *buffer = request->findBuffer(&stream_);
+			if (buffer) {
+				MappedFrameBuffer mapped(buffer,
+							 MappedFrameBuffer::MapFlag::Write);
+				if (mapped.isValid()) {'''
+
+new = '''		if (request) {
+			FrameBuffer *buffer = request->findBuffer(&stream_);
+
+			/*
+			 * Guard against a stale/cancelled request BEFORE we
+			 * spend ~50 ms on the memcpy below. Without this guard,
+			 * Request::Private::completeBuffer() aborts on
+			 *   ASSERT(pending_.erase(buffer) == 1);
+			 * (request.cpp:111), taking wireplumber with it. See
+			 * archlinux-ipu6-webcam IPU6-investigation-2026-05-22.md
+			 * gotcha #4 for the recurring backtrace this fixes.
+			 *
+			 * If we skip, we STILL must call completeRequest() when
+			 * the request is still RequestPending, otherwise it sits
+			 * in Camera::Private::queuedRequests_ forever, blocking
+			 * all subsequent completions behind it (which manifests
+			 * as PipeWire "target not found" and a graph-goes-stale
+			 * symptom after some uptime). complete() asserts
+			 * status==RequestPending && !hasPendingBuffers(); both
+			 * are exactly the guard's preconditions in that arm.
+			 */
+			bool __ipu6_stale = !buffer ||
+				request->status() != Request::RequestPending ||
+				!request->_d()->hasPendingBuffers();
+			if (__ipu6_stale) {
+				LOG(IPU6, Debug)
+					<< "Skipping stale request in worker "
+					   "(cancelled or completed elsewhere)";
+				if (request->status() == Request::RequestPending &&
+				    !request->_d()->hasPendingBuffers()) {
+					/*
+					 * Drain from queuedRequests_. safe: complete()'s
+					 * asserts (status==Pending, !hasPendingBuffers)
+					 * both hold here by construction.
+					 */
+					pipe()->completeRequest(request);
+				}
+			} else if (buffer) {
+				MappedFrameBuffer mapped(buffer,
+							 MappedFrameBuffer::MapFlag::Write);
+				if (mapped.isValid()) {'''
+
+if old not in s:
+    raise SystemExit("PKGBUILD 0003 python transform: 'old' block not found in ipu6.cpp -- source drift?")
+s = s.replace(old, new, 1)
+open(p, 'w').write(s)
+PY
 
   # The fork ships ov01a10.yaml in src/ipa/simple/data/ but its meson.build
   # only installs uncalibrated.yaml. Add ov01a10.yaml to the install list.

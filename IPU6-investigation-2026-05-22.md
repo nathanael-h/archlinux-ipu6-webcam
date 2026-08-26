@@ -438,11 +438,64 @@ errors.
 
 ### 4. Recurring wireplumber crash in `IPU6CameraData::workerThread()` — **fixed on this branch**
 
-> **Update 2026-07-01**: after a fourth crash (2026-07-01 16:16, same
-> exact stack offsets as the earlier three), promoted the workaround
-> to a local fix. See
-> [libcamera-ipu6-fix/0003-ipu6-workerThread-drop-stale-buffers-instead-of-asserting.patch](libcamera-ipu6-fix/0003-ipu6-workerThread-drop-stale-buffers-instead-of-asserting.patch).
-> The remainder of this section is preserved as diagnostic context.
+> **Update 2026-08-26 (`libcamera-ipu6-fix` pkgrel=3)**: pkgrel=2 fixed
+> the CPU-cost + log-noise problems of pkgrel=1 (guard moved before
+> memcpy, log downgraded to Debug), but user reported a new symptom:
+> PipeWire graph "goes stale" after some uptime — Firefox reports
+> "webcam not working", full-stack restart (`systemctl --user
+> restart pipewire pipewire-pulse wireplumber xdg-desktop-portal` +
+> Firefox restart) fixes it, and the pattern recurs. Sometimes wireplumber
+> also SIGSEGVs in `Request::Private::prepare()` called from
+> `PipelineHandler::queueRequest()` (unrelated stack trace to the
+> workerThread SIGABRT we originally fixed).
+>
+> Root cause identified via a deep-dive into libcamera's request-queue
+> ownership: **the guard's skip path leaks Requests into
+> `Camera::Private::queuedRequests_` forever**. `PipelineHandler::completeRequest`
+> (`pipeline_handler.cpp:592-600`) is the only site that pops from that
+> queue, and it stops at the first `RequestPending` at the head. If the
+> guard silently skips a Request, that Request stays there with
+> `status=RequestPending`, blocking every later completion. That's the
+> PipeWire target-not-found / graph-stale symptom. The `prepare()`
+> SIGSEGV may be a downstream effect (memory/state corruption from the
+> accumulating leak) or an independent bug — pkgrel=3 addresses only
+> the leak; we'll see if the SEGV survives it.
+>
+> pkgrel=3 fix: when the guard fires with `status == RequestPending`,
+> ALSO call `pipe()->completeRequest(request)` to drain from
+> `queuedRequests_`. Safe because `Request::Private::complete()`'s
+> two asserts (status=Pending and !hasPendingBuffers) are exactly what
+> the guard just verified. When `status != RequestPending`, keep pure
+> skip — a second `complete()` would trip its own assert.
+>
+> **Update 2026-08-25 (`libcamera-ipu6-fix` pkgrel=2)**: no crashes in
+> the ~2 months since pkgrel=1 shipped ✓. But the guard fires in
+> bursts of 20+ per second during camera start/stop transitions.
+> Every fire = one dropped frame. Result: no SIGABRT, but Firefox /
+> video-call apps see the camera as "not working" during the drop
+> bursts (they time out waiting for a first frame).
+>
+> pkgrel=2 widens the guard:
+>   - Guard moved BEFORE the ~50 ms memcpy (previously wasted ~1 s of
+>     CPU per burst on data destined for the trash).
+>   - Also check `request->status() == RequestPending` — a request in
+>     RequestComplete/RequestCancelled state should never be processed.
+>   - Log level Warning → Debug — the bursts flood the journal and
+>     they're the expected behaviour of a working guard, not a warning
+>     event.
+>
+> The patch is applied via a Python string-replace in
+> [libcamera-ipu6-fix/PKGBUILD](libcamera-ipu6-fix/PKGBUILD)'s
+> `prepare()` (large multi-line block replacement; more robust than
+> a unified diff whose context drifts between patch iterations).
+> The `.patch` file at
+> [libcamera-ipu6-fix/0003-...](libcamera-ipu6-fix/0003-ipu6-workerThread-drop-stale-buffers-instead-of-asserting.patch)
+> is now a human-readable rationale only, not applied by `patch -Np1`.
+>
+> **Update 2026-07-01 (`libcamera-ipu6-fix` pkgrel=1)**: after a fourth
+> crash (2026-07-01 16:16, same exact stack offsets as the earlier
+> three), promoted the workaround to a local fix. See the pkgrel=1
+> section below for the original patch (Warning-level, post-memcpy).
 >
 > **Update 2026-05-28**: this is no longer a "single occurrence" — three
 > crashes now logged in `~/sound-video-crash/`, all with identical
@@ -480,19 +533,51 @@ also the current HEAD of that branch. The branch is "12 commits ahead
 of and 88 commits behind libcamera-org/libcamera:master" — no churn on
 the IPU6 handler since the AUR pin was set.
 
-**Fix landed 2026-07-01** in `libcamera-ipu6-fix/`. Guards the worker's
-`completeBuffer()` call with a `request->_d()->hasPendingBuffers()`
-check; drops stale buffers with a warning instead of aborting:
+**Fix pkgrel=1 landed 2026-07-01** in `libcamera-ipu6-fix/`. Original
+guard: catches the crash at the `completeBuffer()` call site, drops
+stale buffers with a Warning-level log instead of aborting. Prevented
+the SIGABRT successfully (zero crashes over the ~2 months it was
+deployed). But logged at Warning and ran AFTER the memcpy, so a fired
+guard still burned ~50 ms per stale buffer + flooded the journal:
 
 ```cpp
-// libcamera-ipu6-fix/0003-...workerThread...patch, in ipu6.cpp near
-// the existing completeBuffer() call at ipu6.cpp:457
+// libcamera-ipu6-fix/0003-...patch pkgrel=1, in ipu6.cpp near the
+// existing completeBuffer() call at ipu6.cpp:457
 if (!request->_d()->hasPendingBuffers()) {
     LOG(IPU6, Warning)
         << "Dropping stale buffer for cancelled/completed request";
 } else {
     pipe()->completeBuffer(request, buffer);
     pipe()->completeRequest(request);
+}
+```
+
+**Fix pkgrel=2 landed 2026-08-25**. Widens the guard after seeing it
+fire in bursts of 20+ per second during camera start/stop transitions.
+Moved BEFORE the memcpy, added `status() == RequestPending` check,
+downgraded log to Debug. Fixed the CPU/log-noise problems, but silently
+kept the queuedRequests_ leak from pkgrel=1 (see pkgrel=3 note above).
+
+**Fix pkgrel=3 landed 2026-08-26**. Adds `pipe()->completeRequest(request)`
+in the skip path when `status == RequestPending`, so the stale request
+is drained from `queuedRequests_` instead of leaking:
+
+```cpp
+// libcamera-ipu6-fix/0003-...patch pkgrel=3 — applied via Python
+// string-replace in PKGBUILD prepare(). Skip-path now drains.
+bool __ipu6_stale = !buffer ||
+    request->status() != Request::RequestPending ||
+    !request->_d()->hasPendingBuffers();
+if (__ipu6_stale) {
+    LOG(IPU6, Debug)
+        << "Skipping stale request in worker "
+           "(cancelled or completed elsewhere)";
+    if (request->status() == Request::RequestPending &&
+        !request->_d()->hasPendingBuffers()) {
+        pipe()->completeRequest(request);  // <-- pkgrel=3 addition
+    }
+} else if (buffer) {
+    /* ...MappedFrameBuffer + memcpy + metadata + completeBuffer + completeRequest... */
 }
 ```
 
